@@ -115,6 +115,13 @@ label.f input,label.f select,label.f textarea,.lines input,.lines select{border:
 .toast.show{opacity:1}
 .notice{padding:10px 12px;border-radius:8px;background:var(--warn-soft);color:var(--warn);margin-bottom:14px;font-size:13px}
 .notice.hidden{display:none}
+.gate{max-width:440px;margin:8vh auto 0;padding:24px}
+.gate h1{margin-bottom:6px}
+.gate form{display:flex;flex-direction:column;gap:10px;margin-top:16px}
+.gate input{border:1px solid var(--border);background:var(--bg);border-radius:8px;padding:9px 11px}
+.gate .actions{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+.mode .btn{margin-top:8px}
+.mode .who{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 @media (max-width:900px){
   .kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
   .grid2{grid-template-columns:1fr}
@@ -126,7 +133,8 @@ label.f input,label.f select,label.f textarea,.lines input,.lines select{border:
   nav{display:flex;gap:4px;overflow-x:auto;padding-bottom:4px}
   nav a{white-space:nowrap;padding:6px 10px}
   nav svg{display:none}
-  .mode{display:none}
+  .mode{margin:4px 0 6px;padding:6px 10px;font-size:11.5px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .mode .btn{margin-top:0}
   main{padding:16px 16px 60px}
   .form{grid-template-columns:1fr}
   .bar{grid-template-columns:80px 1fr 80px}
@@ -148,6 +156,7 @@ label.f input,label.f select,label.f textarea,.lines input,.lines select{border:
 <div class="overlay" id="overlay"><div class="modal" id="modal"></div></div>
 <div class="toast" id="toast"></div>
 
+<script src="config.js"></script>
 <script>
 (function(){
 "use strict";
@@ -170,6 +179,12 @@ const COLS = ["products","customers","suppliers","sales","purchases"];
 const S = {}; COLS.forEach(c => S[c] = {});
 let backend = null;      // {kind, put(col,id,data), del(col,id)}
 let readOnly = false;
+const CFG = window.ERP_CONFIG || {};
+const USE_SB = !!(CFG.supabaseUrl && CFG.supabaseAnonKey);
+const SB_CDN = "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js";
+let sb = null, sbStarted = false;
+// gate: null when the app is usable, otherwise {kind:"loading"|"login"|"sent"|"denied", email, msg}
+let gate = USE_SB ? {kind:"loading", msg:"Connecting…"} : null;
 const ui = { q:{}, status:{} };
 
 // ---------- helpers ----------
@@ -206,7 +221,7 @@ async function remove(col, id){
 }
 function handleWriteError(e){
   const code = e && e.code;
-  if (code === "invalid_argument") { readOnly = true; setNotice("You can view this ERP but not change it. Ask the owner for Contributor access."); }
+  if (code === "invalid_argument") { readOnly = true; setNotice("You can view this ERP but not change it. Ask the owner for edit access."); }
   else if (code === "quota_exceeded") toast("Storage is full. Delete some old records and try again.");
   else toast("Couldn't save. Check your connection and try again.");
   render();
@@ -228,6 +243,78 @@ function dbBackend(db){
     del:(col,id)=>serialize(col+"/"+id, ()=>db.collection(col).doc(id).delete())
   };
 }
+
+// ---------- Supabase (shared database with email sign-in) ----------
+function loadScript(src){
+  return new Promise((res,rej)=>{ const s=document.createElement("script"); s.src=src; s.onload=res; s.onerror=()=>rej(new Error("load failed")); document.head.appendChild(s); });
+}
+function sbBackend(){
+  const run = async q => {
+    const { error } = await q;
+    if (error) throw { code: error.code === "42501" ? "invalid_argument" : "unavailable", message: error.message };
+  };
+  return {
+    kind:"supabase",
+    put:(col,id,data)=>serialize(col+"/"+id, ()=>run(sb.from("erp_records").upsert({col,id,data}))),
+    del:(col,id)=>serialize(col+"/"+id, ()=>run(sb.from("erp_records").delete().eq("col",col).eq("id",id)))
+  };
+}
+async function startSupabase(){
+  booted = true; setMode("connecting"); render();
+  try { await loadScript(SB_CDN); }
+  catch(_) { gate={kind:"loading", msg:"Couldn't load the database library. Check your connection and reload the page."}; return render(); }
+  sb = window.supabase.createClient(CFG.supabaseUrl, CFG.supabaseAnonKey);
+  // Supabase calls inside this callback can deadlock, so hand off with setTimeout.
+  sb.auth.onAuthStateChange((_event, session)=>{ if (session && !sbStarted) setTimeout(()=>sbAfterLogin(session), 0); });
+  const { data } = await sb.auth.getSession();
+  if (data && data.session) sbAfterLogin(data.session);
+  else if (!sbStarted) { gate={kind:"login"}; setMode("signedout"); render(); }
+}
+async function sbAfterLogin(session){
+  if (sbStarted) return; sbStarted = true;
+  const email = String(session.user && session.user.email || "").toLowerCase();
+  gate = {kind:"loading", msg:"Loading data…"}; setMode("supabase", email); render();
+  const allow = await sb.from("erp_allowed_emails").select("email").limit(1);
+  if (allow.error || !allow.data || !allow.data.length) { gate={kind:"denied", email}; return render(); }
+  COLS.forEach(c => S[c] = {});
+  const PAGE = 1000;
+  for (let from = 0; ; from += PAGE) {
+    const r = await sb.from("erp_records").select("col,id,data").range(from, from + PAGE - 1);
+    if (r.error) { gate={kind:"loading", msg:"Couldn't load data: " + r.error.message}; return render(); }
+    r.data.forEach(row => { if (S[row.col]) S[row.col][row.id] = row.data; });
+    if (r.data.length < PAGE) break;
+  }
+  backend = sbBackend(); gate = null; render();
+  sb.channel("erp-records")
+    .on("postgres_changes", {event:"*", schema:"public", table:"erp_records"}, p => {
+      if (p.eventType === "DELETE") { const o = p.old || {}; if (S[o.col]) delete S[o.col][o.id]; }
+      else { const n = p.new || {}; if (S[n.col]) S[n.col][n.id] = n.data; }
+      if (!$("#overlay").classList.contains("open")) render(); else renderNav();
+    })
+    .subscribe(status => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") setNotice("Live updates paused. Reload the page to see other people's latest changes.");
+      else if (status === "SUBSCRIBED" && !readOnly) setNotice("");
+    });
+}
+function gateView(){
+  const g = gate;
+  if (g.kind === "loading") return `<div class="card gate"><h1>Mini ERP</h1><div class="sub">${esc(g.msg || "Loading…")}</div></div>`;
+  if (g.kind === "denied") return `<div class="card gate"><h1>No access yet</h1><div class="sub"><b>${esc(g.email)}</b> isn't on this ERP's approved list. Ask the owner to add your email, then reload this page.</div><div class="actions"><button class="btn" data-act="signout">Sign out</button></div></div>`;
+  if (g.kind === "sent") return `<div class="card gate"><h1>Check your email</h1><div class="sub">We sent a sign-in link to <b>${esc(g.email)}</b>. Open it in this browser to continue.</div><div class="actions"><button class="btn" data-act="gate-back">Use a different email</button></div></div>`;
+  return `<div class="card gate"><h1>Sign in to Mini ERP</h1><div class="sub">Enter your email and we'll send you a sign-in link. Only approved emails can open the data.</div>
+    <form id="gate-form"><input type="email" name="email" required placeholder="you@example.com" autocomplete="email" value="${esc(g.email || "")}">
+    <button class="btn primary" type="submit">Send sign-in link</button><div class="err">${esc(g.msg || "")}</div></form></div>`;
+}
+document.addEventListener("submit", async e => {
+  if (e.target.id !== "gate-form") return;
+  e.preventDefault();
+  const email = e.target.email.value.trim();
+  const btn = e.target.querySelector("button"); btn.disabled = true; btn.textContent = "Sending…";
+  const { error } = await sb.auth.signInWithOtp({ email, options:{ emailRedirectTo: location.origin + location.pathname } });
+  const msg = error && (/fetch|network/i.test(error.message) ? "Couldn't reach the database. Check your connection and the settings in config.js." : error.message);
+  gate = error ? {kind:"login", email, msg} : {kind:"sent", email};
+  render();
+});
 
 function seedDemo(){
   const p = (sku,name,category,unit,cost,price,stock,reorder)=>{ S.products[sku.toLowerCase()]={sku,name,category,unit,cost,price,stock,reorder}; };
@@ -251,9 +338,12 @@ function seedDemo(){
 
 // ---------- shell ----------
 function setNotice(msg){ const n=$("#notice"); n.textContent=msg||""; n.classList.toggle("hidden",!msg); }
-function setMode(kind){
+function setMode(kind, email){
   const m=$("#mode");
   if(kind==="db") m.innerHTML='<b><span class="dot live"></span>Shared database</b>Changes sync live for everyone with access.';
+  else if(kind==="supabase") m.innerHTML=`<div style="min-width:0"><b><span class="dot live"></span>Shared database</b><span class="who">${esc(email||"")}</span></div><button class="btn sm" data-act="signout">Sign out</button>`;
+  else if(kind==="signedout") m.innerHTML='<b><span class="dot"></span>Shared database</b>Sign in to see the data.';
+  else if(kind==="connecting") m.innerHTML='<b><span class="dot"></span>Connecting…</b>';
   else m.innerHTML='<b><span class="dot local"></span>Local demo</b>Data is saved in this browser only.';
 }
 function route(){ const h=(location.hash||"").slice(1); return ROUTES.some(r=>r[0]===h)?h:"dashboard"; }
@@ -264,6 +354,7 @@ function renderNav(){
 function render(){
   renderNav();
   const r=route(), v=$("#view");
+  if(gate){ v.innerHTML=gateView(); const i=v.querySelector("#gate-form input"); if(i&&document.activeElement===document.body) i.focus(); return; }
   const focus = document.activeElement && document.activeElement.dataset && document.activeElement.dataset.keep;
   const caret = focus ? document.activeElement.selectionStart : null;
   v.innerHTML = VIEWS[r]();
@@ -508,6 +599,9 @@ document.addEventListener("click",async e=>{
   if(t.dataset.open){ const c=t.dataset.open,id=t.dataset.id; if(!S[c][id]) return;
     if(c==="products") productModal(id); else if(c==="sales"||c==="purchases") orderModal(c,id); else partyModal(c,id); return; }
   if(t.dataset.act){ const a=t.dataset.act;
+    if(a==="signout"){ try{ if(sb) await sb.auth.signOut(); }catch(_){} location.reload(); return; }
+    if(a==="gate-back"){ gate={kind:"login", email:gate&&gate.email}; render(); return; }
+    if(gate) return;
     if(a==="new-product") productModal();
     else if(a==="new-so") { if(!list("customers").length) return toast("Add a customer first."); orderModal("sales"); }
     else if(a==="new-po") { if(!list("suppliers").length) return toast("Add a supplier first."); orderModal("purchases"); }
@@ -531,7 +625,8 @@ window.addEventListener("hashchange",render);
 render();
 let booted=false;
 function startLocal(){ if(booted) return; booted=true; backend=localBackend(); setMode("local"); render(); }
-(async()=>{
+if(USE_SB) startSupabase();
+else (async()=>{
   let db=null;
   try{ if(window.claude&&typeof window.claude.use==="function") db=await window.claude.use("db"); }catch(_){ db=null; }
   if(!db) return startLocal();
